@@ -35,17 +35,20 @@ async function createMailbox(
 	expect(response.status).toBe(201);
 }
 
-function cloudflareEmailEvent(rawMessage: string): ForwardableEmailMessage {
+function cloudflareEmailEvent(
+	rawMessage: string,
+	envelopeRecipient = mailboxAddress,
+): ForwardableEmailMessage {
 	const from = "sender@external.test";
-	const to = mailboxAddress;
+	const headerRecipient = mailboxAddress;
 	const raw = new TextEncoder().encode(rawMessage);
 
 	return {
 		from,
-		to,
+		to: envelopeRecipient,
 		headers: new Headers({
 			From: from,
-			To: to,
+			To: headerRecipient,
 			Subject: "Welcome",
 			"Message-ID": "<welcome-1@external.test>",
 			"Content-Type": "text/plain; charset=utf-8",
@@ -139,6 +142,22 @@ describe("Worker behavior", () => {
 		}, singleDomainEnv);
 
 		expect(rejected.status).toBe(403);
+	});
+
+	it("fails closed when no mailbox domains are configured", async () => {
+		const noDomainEnv = {
+			...workerEnv,
+			DOMAINS: "",
+			EMAIL_ADDRESSES: [],
+		} as TestEnv;
+
+		const response = await request("/api/v1/mailboxes", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ email: mailboxAddress, name: "Nope" }),
+		}, noDomainEnv);
+
+		expect(response.status).toBe(403);
 	});
 
 	it("uses exact addresses as a stricter multi-domain allowlist", async () => {
@@ -263,6 +282,37 @@ describe("Worker behavior", () => {
 				},
 			],
 		});
+		await waitOnExecutionContext(context);
+	});
+
+	it("routes inbound mail using the SMTP envelope recipient", async () => {
+		const secondMailbox = "hello@second.test";
+		await createMailbox(mailboxAddress, "Example Hello");
+		await createMailbox(secondMailbox, "Second Hello");
+
+		const context = createExecutionContext();
+		await worker.email(
+			cloudflareEmailEvent(
+				"From: sender@external.test\r\n" +
+					"To: hello@example.com\r\n" +
+					"Subject: Envelope recipient\r\n" +
+					"Content-Type: text/plain; charset=utf-8\r\n" +
+					"\r\n" +
+					"Hello\r\n",
+				secondMailbox,
+			),
+			workerEnv,
+			context,
+		);
+
+		const secondResponse = await request(
+			`/api/v1/mailboxes/${secondMailbox}/emails?folder=inbox`,
+		);
+		expect(await secondResponse.json()).toMatchObject({ totalCount: 1 });
+		const firstResponse = await request(
+			`/api/v1/mailboxes/${mailboxAddress}/emails?folder=inbox`,
+		);
+		expect(await firstResponse.json()).toMatchObject({ totalCount: 0 });
 		await waitOnExecutionContext(context);
 	});
 });

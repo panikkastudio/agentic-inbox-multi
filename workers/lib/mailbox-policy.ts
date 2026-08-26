@@ -47,7 +47,7 @@ export function isAllowedMailboxAddress(
 		return policy.emailAddresses.includes(normalizedEmail);
 	}
 
-	if (policy.domains.length === 0) return true;
+	if (policy.domains.length === 0) return false;
 	const atIndex = normalizedEmail.lastIndexOf("@");
 	if (atIndex < 0) return false;
 

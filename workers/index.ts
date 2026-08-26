@@ -5,6 +5,7 @@
 import { type Context, Hono } from "hono";
 import { cors } from "hono/cors";
 import PostalMime from "postal-mime";
+import type { ForwardableEmailMessage } from "@cloudflare/workers-types";
 import { z } from "zod";
 import { sendEmail } from "./email-sender";
 import { storeAttachments, type StoredAttachment } from "./lib/attachments";
@@ -339,7 +340,10 @@ app.get("/api/v1/mailboxes/:mailboxId/emails/:emailId/attachments/:attachmentId"
 
 const MAX_EMAIL_SIZE = 25 * 1024 * 1024;
 
-async function streamToArrayBuffer(stream: ReadableStream, streamSize: number) {
+async function streamToArrayBuffer(
+	stream: ForwardableEmailMessage["raw"],
+	streamSize: number,
+) {
 	if (streamSize > MAX_EMAIL_SIZE) throw new Error(`Email too large: ${streamSize} bytes exceeds ${MAX_EMAIL_SIZE} byte limit`);
 	if (streamSize <= 0) throw new Error(`Invalid stream size: ${streamSize}`);
 	const result = new Uint8Array(streamSize);
@@ -355,14 +359,15 @@ async function streamToArrayBuffer(stream: ReadableStream, streamSize: number) {
 	return result;
 }
 
-async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env: Env, ctx: ExecutionContext) {
+async function receiveEmail(event: ForwardableEmailMessage, env: Env, ctx: ExecutionContext) {
 	const rawEmail = await streamToArrayBuffer(event.raw, event.rawSize);
 	const parsedEmail = await new PostalMime().parse(rawEmail);
 
-	if (!parsedEmail.to?.length || !parsedEmail.to[0].address) throw new Error("received email with empty to");
+	if (!event.to) throw new Error("received email with empty envelope recipient");
 
 	const policy = getMailboxPolicy(env.DOMAINS, env.EMAIL_ADDRESSES);
-	const allRecipients = parsedEmail.to
+	const envelopeRecipient = normalizeEmailAddress(event.to);
+	const allRecipients = (parsedEmail.to || [])
 		.map((t) => t.address && normalizeEmailAddress(t.address))
 		.filter(Boolean) as string[];
 	const ccRecipients = (parsedEmail.cc || [])
@@ -372,13 +377,11 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 		.map((e) => e.address && normalizeEmailAddress(e.address))
 		.filter(Boolean) as string[];
 
-	const mailboxId = allRecipients.find((address) =>
-		isAllowedMailboxAddress(address, policy),
-	);
-	if (!mailboxId) {
+	if (!isAllowedMailboxAddress(envelopeRecipient, policy)) {
 		console.log("Ignoring email: no recipient matches the mailbox configuration.");
 		return;
 	}
+	const mailboxId = envelopeRecipient;
 
 	const messageId = crypto.randomUUID();
 	if (!(await env.BUCKET.head(`mailboxes/${mailboxId}.json`))) { console.log(`Ignoring email for ${mailboxId}: mailbox does not exist`); return; }
