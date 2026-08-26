@@ -57,6 +57,12 @@ npm install
 npm run dev
 ```
 
+Run the local Worker behavior tests (including local R2 and Durable Object bindings) with:
+
+```bash
+npm run test:worker
+```
+
 ### Configuration
 
 1. Set your domain in `wrangler.jsonc`
