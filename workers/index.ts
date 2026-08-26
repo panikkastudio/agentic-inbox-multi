@@ -427,7 +427,11 @@ async function receiveEmail(event: ForwardableEmailMessage, env: Env, ctx: Execu
 
 	const agentStub = env.EMAIL_AGENT.get(env.EMAIL_AGENT.idFromName(mailboxId));
 	ctx.waitUntil(agentStub.fetch(new Request("https://agents/onNewEmail", {
-		method: "POST", headers: { "Content-Type": "application/json" },
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			"x-partykit-room": mailboxId,
+		},
 		body: JSON.stringify({ mailboxId, emailId: messageId, sender: (parsedEmail.from?.address || "").toLowerCase(), subject: parsedEmail.subject || "", threadId }),
 	})).catch((e) => console.error("Auto-draft trigger failed:", (e as Error).message)));
 }

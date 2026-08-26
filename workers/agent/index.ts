@@ -334,7 +334,6 @@ export class EmailAgent extends AIChatAgent<any> {
 		threadId: string;
 	}) {
 		const env = this.env as Env;
-		const workersai = createWorkersAI({ binding: env.AI });
 		const tools = createEmailTools(env, emailData.mailboxId);
 		const systemPrompt = await getSystemPrompt(env, emailData.mailboxId);
 
@@ -462,6 +461,7 @@ Based on the email content and thread context above, draft a reply using draft_r
 		];
 
 		try {
+			const workersai = createWorkersAI({ binding: env.AI });
 			const result = await generateText({
 				model: workersai("@cf/moonshotai/kimi-k2.5"),
 				system: systemPrompt,

@@ -390,6 +390,90 @@ describe("Worker behavior", () => {
 		}
 	});
 
+	it("isolates inbound attachments and Email Agent context by domain", async () => {
+		const firstMailbox = "hello@example.com";
+		const secondMailbox = "hello@second.test";
+		const emailEnv = workerEnv;
+		await createMailbox(firstMailbox, "Example Hello", emailEnv);
+		await createMailbox(secondMailbox, "Second Hello", emailEnv);
+
+		const subjects = new Map<string, string>();
+		const agentMessages = new Map<string, string>();
+		for (const mailbox of [firstMailbox, secondMailbox]) {
+			const subject = `Inbound for ${mailbox}`;
+			subjects.set(mailbox, subject);
+			const attachmentBody = mailbox === firstMailbox
+				? "Example attachment"
+				: "Second attachment";
+			const rawMessage = [
+				"From: sender@external.test",
+				"To: wrong@example.com",
+				"Subject: " + subject,
+				"Message-ID: <" + mailbox.replace("@", "-") + ">",
+				"Content-Type: multipart/mixed; boundary=boundary",
+				"",
+				"--boundary",
+				"Content-Type: text/plain; charset=utf-8",
+				"",
+				"Inbound body",
+				"--boundary",
+				"Content-Type: text/plain; name=note.txt",
+				"Content-Disposition: attachment; filename=note.txt",
+				"Content-Transfer-Encoding: base64",
+				"",
+				btoa(attachmentBody),
+				"--boundary--",
+				"",
+			].join("\r\n");
+
+			const context = createExecutionContext();
+			await worker.email(
+				cloudflareEmailEvent(rawMessage, mailbox),
+				emailEnv,
+				context,
+			);
+			await waitOnExecutionContext(context);
+
+			const inboxResponse = await request(
+				`/api/v1/mailboxes/${mailbox}/emails?folder=inbox`,
+				undefined,
+				emailEnv,
+			);
+			const inbox = await inboxResponse.json() as { emails: Array<{ id: string }>; totalCount: number };
+			expect(inbox.totalCount).toBe(1);
+
+			const detailResponse = await request(
+				`/api/v1/mailboxes/${mailbox}/emails/${inbox.emails[0].id}`,
+				undefined,
+				emailEnv,
+			);
+			const detail = await detailResponse.json() as {
+				attachments: Array<{ id: string; filename: string }>;
+			};
+			expect(detail.attachments).toMatchObject([{ filename: "note.txt" }]);
+
+			const attachmentResponse = await request(
+				`/api/v1/mailboxes/${mailbox}/emails/${inbox.emails[0].id}/attachments/${detail.attachments[0].id}`,
+				undefined,
+				emailEnv,
+			);
+			expect(await attachmentResponse.text()).toBe(attachmentBody);
+
+			const agentStub = emailEnv.EMAIL_AGENT.get(emailEnv.EMAIL_AGENT.idFromName(mailbox));
+			const messagesResponse = await agentStub.fetch(new Request("https://agents/get-messages", {
+				headers: { "x-partykit-room": mailbox },
+			}));
+			expect(messagesResponse.status).toBe(200);
+			const messages = await messagesResponse.json() as unknown[];
+			expect(messages).toHaveLength(2);
+			agentMessages.set(mailbox, JSON.stringify(messages));
+			expect(agentMessages.get(mailbox)).toContain(subject);
+		}
+
+		expect(agentMessages.get(firstMailbox)).not.toContain(subjects.get(secondMailbox));
+		expect(agentMessages.get(secondMailbox)).not.toContain(subjects.get(firstMailbox));
+	});
+
 	it("delivers BCC mail without a MIME To recipient", async () => {
 		const secondMailbox = "hello@second.test";
 		await createMailbox(secondMailbox, "Second Hello");
