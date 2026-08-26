@@ -30,6 +30,7 @@ import { verifyDraft } from "./ai";
 import { sendEmail } from "../email-sender";
 import { Folders } from "../../shared/folders";
 import type { Env } from "../types";
+import { getMailboxPolicy, isAllowedMailboxAddress } from "./mailbox-policy";
 
 // ── Type casts for DO methods not on the base stub type ────────────
 type MailboxSearchStub = {
@@ -404,6 +405,10 @@ export async function toolSendReply(
 	| { error: string }
 > {
 	const stub = getMailboxStub(env, mailboxId);
+	const policy = getMailboxPolicy(env.DOMAINS, env.EMAIL_ADDRESSES);
+	if (!isAllowedMailboxAddress(mailboxId, policy)) {
+		return { error: "Mailbox address is not allowed by the mailbox configuration" };
+	}
 
 	// Check send rate limit
 	const rateLimitError = await (stub as unknown as RateLimitStub).checkSendRateLimit();
@@ -439,7 +444,10 @@ export async function toolSendReply(
 			from: mailboxId,
 			subject: params.subject,
 			html: fullBodyHtml,
-			headers: buildThreadingHeaders(originalMsgId, references),
+			headers: {
+				"Message-ID": `<${outgoingMessageId}>`,
+				...buildThreadingHeaders(originalMsgId, references),
+			},
 		});
 	} catch (e) {
 		console.error("Email send failed:", (e as Error).message);
@@ -482,6 +490,10 @@ export async function toolSendEmail(
 	| { error: string }
 > {
 	const stub = getMailboxStub(env, mailboxId);
+	const policy = getMailboxPolicy(env.DOMAINS, env.EMAIL_ADDRESSES);
+	if (!isAllowedMailboxAddress(mailboxId, policy)) {
+		return { error: "Mailbox address is not allowed by the mailbox configuration" };
+	}
 
 	// Check send rate limit
 	const rateLimitError = await (stub as unknown as RateLimitStub).checkSendRateLimit();
@@ -504,6 +516,7 @@ export async function toolSendEmail(
 			from: mailboxId,
 			subject: params.subject,
 			html: sanitizedBody,
+			headers: { "Message-ID": `<${outgoingMessageId}>` },
 		});
 	} catch (e) {
 		console.error("Email send failed:", (e as Error).message);

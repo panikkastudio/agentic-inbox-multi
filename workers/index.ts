@@ -20,6 +20,11 @@ import { handleReplyEmail, handleForwardEmail } from "./routes/reply-forward";
 import { Folders } from "../shared/folders";
 import type { Env } from "./types";
 import { requireMailbox, type MailboxContext } from "./lib/mailbox";
+import {
+	getMailboxPolicy,
+	isAllowedMailboxAddress,
+	normalizeEmailAddress,
+} from "./lib/mailbox-policy";
 
 type AppContext = Context<MailboxContext>;
 
@@ -86,10 +91,7 @@ app.use("/api/v1/mailboxes/:mailboxId/*", requireMailbox);
 // -- Config ---------------------------------------------------------
 
 app.get("/api/v1/config", (c) => {
-	const domainsRaw = c.env.DOMAINS || "";
-	const domains = domainsRaw.split(",").map((d) => d.trim()).filter(Boolean);
-	const emailAddresses = c.env.EMAIL_ADDRESSES ?? [];
-	return c.json({ domains, emailAddresses });
+	return c.json(getMailboxPolicy(c.env.DOMAINS, c.env.EMAIL_ADDRESSES));
 });
 
 // -- Mailboxes ------------------------------------------------------
@@ -101,10 +103,10 @@ app.get("/api/v1/mailboxes", async (c) => {
 
 app.post("/api/v1/mailboxes", async (c) => {
 	const { name, settings, email: rawEmail } = CreateMailboxBody.parse(await c.req.json());
-	const email = rawEmail.toLowerCase();
-	const allowedAddresses = (c.env.EMAIL_ADDRESSES ?? []) as string[];
-	if (allowedAddresses.length > 0 && !allowedAddresses.map((a) => a.toLowerCase()).includes(email)) {
-		return c.json({ error: "Mailbox creation is restricted to configured EMAIL_ADDRESSES" }, 403);
+	const email = normalizeEmailAddress(rawEmail);
+	const policy = getMailboxPolicy(c.env.DOMAINS, c.env.EMAIL_ADDRESSES);
+	if (!isAllowedMailboxAddress(email, policy)) {
+		return c.json({ error: "Mailbox address is not allowed by the mailbox configuration" }, 403);
 	}
 	const key = `mailboxes/${email}.json`;
 	if (await c.env.BUCKET.head(key)) return c.json({ error: "Mailbox already exists" }, 409);
@@ -172,7 +174,12 @@ app.post("/api/v1/mailboxes/:mailboxId/emails", async (c: AppContext) => {
 
 	let toStr: string, fromEmail: string, fromDomain: string;
 	try {
-		({ toStr, fromEmail, fromDomain } = validateSender(to, from, mailboxId));
+		({ toStr, fromEmail, fromDomain } = validateSender(
+			to,
+			from,
+			mailboxId,
+			getMailboxPolicy(c.env.DOMAINS, c.env.EMAIL_ADDRESSES),
+		));
 	} catch (e) {
 		if (e instanceof SenderValidationError) return c.json({ error: e.message }, 400);
 		throw e;
@@ -205,7 +212,10 @@ app.post("/api/v1/mailboxes/:mailboxId/emails", async (c: AppContext) => {
 		sendEmail(c.env.EMAIL, {
 			to, cc, bcc, from, subject, html, text,
 			attachments: attachments?.map((att) => ({ content: att.content, filename: att.filename, type: att.type, disposition: att.disposition || "attachment", contentId: att.contentId })),
-			...(in_reply_to ? { headers: buildThreadingHeaders(in_reply_to, references || []) } : {}),
+			headers: {
+				"Message-ID": `<${outgoingMessageId}>`,
+				...(in_reply_to ? buildThreadingHeaders(in_reply_to, references || []) : {}),
+			},
 		}).catch((e) => console.error("Deferred email delivery failed:", (e as Error).message)),
 	);
 	return c.json({ id: messageId, status: "sent" }, 202);
@@ -351,17 +361,24 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 
 	if (!parsedEmail.to?.length || !parsedEmail.to[0].address) throw new Error("received email with empty to");
 
-	const allowedAddresses = ((env.EMAIL_ADDRESSES ?? []) as string[]).map((a) => a.toLowerCase());
-	const allRecipients = parsedEmail.to.map((t) => t.address?.toLowerCase()).filter(Boolean) as string[];
-	const ccRecipients = (parsedEmail.cc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
-	const bccRecipients = (parsedEmail.bcc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
+	const policy = getMailboxPolicy(env.DOMAINS, env.EMAIL_ADDRESSES);
+	const allRecipients = parsedEmail.to
+		.map((t) => t.address && normalizeEmailAddress(t.address))
+		.filter(Boolean) as string[];
+	const ccRecipients = (parsedEmail.cc || [])
+		.map((e) => e.address && normalizeEmailAddress(e.address))
+		.filter(Boolean) as string[];
+	const bccRecipients = (parsedEmail.bcc || [])
+		.map((e) => e.address && normalizeEmailAddress(e.address))
+		.filter(Boolean) as string[];
 
-	let mailboxId: string | undefined;
-	if (allowedAddresses.length > 0) {
-		mailboxId = allRecipients.find((addr) => allowedAddresses.includes(addr));
-		if (!mailboxId) { console.log(`Ignoring email: no recipient matches EMAIL_ADDRESSES.`); return; }
-	} else { mailboxId = allRecipients[0]; }
-	if (!mailboxId) throw new Error("received email with no valid recipient address");
+	const mailboxId = allRecipients.find((address) =>
+		isAllowedMailboxAddress(address, policy),
+	);
+	if (!mailboxId) {
+		console.log("Ignoring email: no recipient matches the mailbox configuration.");
+		return;
+	}
 
 	const messageId = crypto.randomUUID();
 	if (!(await env.BUCKET.head(`mailboxes/${mailboxId}.json`))) { console.log(`Ignoring email for ${mailboxId}: mailbox does not exist`); return; }

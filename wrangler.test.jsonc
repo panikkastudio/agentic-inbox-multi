@@ -5,7 +5,7 @@
 	"main": "./workers/app.ts",
 	"compatibility_flags": ["nodejs_compat"],
 	"vars": {
-		"DOMAINS": "example.com",
+		"DOMAINS": " Example.COM., second.test, example.com ",
 		"EMAIL_ADDRESSES": []
 	},
 	"r2_buckets": [

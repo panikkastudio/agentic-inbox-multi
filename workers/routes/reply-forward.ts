@@ -17,6 +17,7 @@ import {
 import { SendEmailRequestSchema } from "../lib/schemas";
 import { Folders } from "../../shared/folders";
 import type { MailboxContext } from "../lib/mailbox";
+import { getMailboxPolicy } from "../lib/mailbox-policy";
 
 type AppContext = Context<MailboxContext>;
 type RateLimitStub = { checkSendRateLimit: () => Promise<string | null> };
@@ -39,7 +40,12 @@ export async function handleReplyEmail(c: AppContext) {
 
 	let toStr: string, fromEmail: string, fromDomain: string;
 	try {
-		({ toStr, fromEmail, fromDomain } = validateSender(to, from, mailboxId));
+		({ toStr, fromEmail, fromDomain } = validateSender(
+			to,
+			from,
+			mailboxId,
+			getMailboxPolicy(c.env.DOMAINS, c.env.EMAIL_ADDRESSES),
+		));
 	} catch (e) {
 		if (e instanceof SenderValidationError) return c.json({ error: e.message }, 400);
 		throw e;
@@ -103,7 +109,10 @@ export async function handleReplyEmail(c: AppContext) {
 				disposition: att.disposition,
 				contentId: att.contentId,
 			})),
-			headers: buildThreadingHeaders(originalMsgId, references),
+			headers: {
+				"Message-ID": `<${outgoingMessageId}>`,
+				...buildThreadingHeaders(originalMsgId, references),
+			},
 		}).catch((e) => {
 			console.error("Deferred reply delivery failed:", (e as Error).message);
 		}),
@@ -129,7 +138,12 @@ export async function handleForwardEmail(c: AppContext) {
 
 	let toStr: string, fromEmail: string, fromDomain: string;
 	try {
-		({ toStr, fromEmail, fromDomain } = validateSender(to, from, mailboxId));
+		({ toStr, fromEmail, fromDomain } = validateSender(
+			to,
+			from,
+			mailboxId,
+			getMailboxPolicy(c.env.DOMAINS, c.env.EMAIL_ADDRESSES),
+		));
 	} catch (e) {
 		if (e instanceof SenderValidationError) return c.json({ error: e.message }, 400);
 		throw e;
@@ -182,6 +196,7 @@ export async function handleForwardEmail(c: AppContext) {
 			subject,
 			html,
 			text,
+			headers: { "Message-ID": `<${outgoingMessageId}>` },
 			attachments: attachments?.map((att) => ({
 				content: att.content,
 				filename: att.filename,

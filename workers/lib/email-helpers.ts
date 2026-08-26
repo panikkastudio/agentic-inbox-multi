@@ -13,6 +13,11 @@ import type { EmailFull } from "./schemas";
 import { Folders } from "../../shared/folders";
 import type { Env } from "../types";
 import { formatQuotedDate } from "../../shared/dates";
+import {
+	isAllowedMailboxAddress,
+	normalizeEmailAddress,
+	type MailboxPolicy,
+} from "./mailbox-policy";
 
 // ── DO Stub ────────────────────────────────────────────────────────
 
@@ -54,16 +59,20 @@ export function validateSender(
 	to: string | string[],
 	from: string | { email: string; name: string },
 	mailboxId: string,
+	policy?: MailboxPolicy,
 ): { toStr: string; fromEmail: string; fromDomain: string } {
 	const toStr = (Array.isArray(to) ? to.join(", ") : to).toLowerCase();
-	const fromEmail = (typeof from === "string" ? from : from.email).toLowerCase();
+	const fromEmail = normalizeEmailAddress(typeof from === "string" ? from : from.email);
 
-	if (fromEmail !== mailboxId.toLowerCase()) {
+	if (fromEmail !== normalizeEmailAddress(mailboxId)) {
 		throw new SenderValidationError("From address must match the mailbox email address");
 	}
+	if (policy && !isAllowedMailboxAddress(fromEmail, policy)) {
+		throw new SenderValidationError("From address is not allowed by the mailbox configuration");
+	}
 
-	const fromDomain = fromEmail.split("@")[1];
-	if (!fromDomain) {
+	const fromDomain = fromEmail.slice(fromEmail.lastIndexOf("@") + 1);
+	if (!fromDomain || fromDomain === fromEmail) {
 		throw new SenderValidationError("Invalid sender email address");
 	}
 

@@ -8,7 +8,7 @@
 		"products": ["Workers", "Durable Objects", "R2", "Workers AI"],
 		"bindings": {
 			"DOMAINS": {
-				"description": "Your domain with [Email Routing](https://developers.cloudflare.com/email-routing/) enabled (e.g. `example.com`). After deploying, create a catch-all Email Routing rule pointing to this Worker."
+				"description": "Comma-separated domains with [Email Routing](https://developers.cloudflare.com/email-routing/) enabled (e.g. `example.com, anotherdomain.com`). After deploying, create catch-all Email Routing rules pointing to this Worker."
 			}
 		}
 	},
