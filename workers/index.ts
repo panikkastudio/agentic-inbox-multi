@@ -360,31 +360,34 @@ async function streamToArrayBuffer(
 }
 
 async function receiveEmail(event: ForwardableEmailMessage, env: Env, ctx: ExecutionContext) {
-	const rawEmail = await streamToArrayBuffer(event.raw, event.rawSize);
-	const parsedEmail = await new PostalMime().parse(rawEmail);
-
 	if (!event.to) throw new Error("received email with empty envelope recipient");
 
-	const policy = getMailboxPolicy(env.DOMAINS, env.EMAIL_ADDRESSES);
-	const envelopeRecipient = normalizeEmailAddress(event.to);
-	const allRecipients = (parsedEmail.to || [])
-		.map((t) => t.address && normalizeEmailAddress(t.address))
-		.filter(Boolean) as string[];
-	const ccRecipients = (parsedEmail.cc || [])
-		.map((e) => e.address && normalizeEmailAddress(e.address))
-		.filter(Boolean) as string[];
-	const bccRecipients = (parsedEmail.bcc || [])
-		.map((e) => e.address && normalizeEmailAddress(e.address))
-		.filter(Boolean) as string[];
+	const mailboxId = normalizeEmailAddress(event.to);
+	if (!mailboxId) throw new Error("received email with empty envelope recipient");
 
-	if (!isAllowedMailboxAddress(envelopeRecipient, policy)) {
-		console.log("Ignoring email: no recipient matches the mailbox configuration.");
+	const policy = getMailboxPolicy(env.DOMAINS, env.EMAIL_ADDRESSES);
+	if (!isAllowedMailboxAddress(mailboxId, policy)) {
+		console.log(`Ignoring email for ${mailboxId}: address is not allowed by the mailbox configuration`);
 		return;
 	}
-	const mailboxId = envelopeRecipient;
+	if (!(await env.BUCKET.head(`mailboxes/${mailboxId}.json`))) {
+		console.log(`Ignoring email for ${mailboxId}: mailbox does not exist`);
+		return;
+	}
+
+	const rawEmail = await streamToArrayBuffer(event.raw, event.rawSize);
+	const parsedEmail = await new PostalMime().parse(rawEmail);
+	const mimeToRecipients = (parsedEmail.to || [])
+		.map((recipient) => recipient.address && normalizeEmailAddress(recipient.address))
+		.filter(Boolean) as string[];
+	const ccRecipients = (parsedEmail.cc || [])
+		.map((recipient) => recipient.address && normalizeEmailAddress(recipient.address))
+		.filter(Boolean) as string[];
+	const bccRecipients = (parsedEmail.bcc || [])
+		.map((recipient) => recipient.address && normalizeEmailAddress(recipient.address))
+		.filter(Boolean) as string[];
 
 	const messageId = crypto.randomUUID();
-	if (!(await env.BUCKET.head(`mailboxes/${mailboxId}.json`))) { console.log(`Ignoring email for ${mailboxId}: mailbox does not exist`); return; }
 
 	const stub = env.MAILBOX.get(env.MAILBOX.idFromName(mailboxId));
 
@@ -414,7 +417,7 @@ async function receiveEmail(event: ForwardableEmailMessage, env: Env, ctx: Execu
 
 	await stub.createEmail(Folders.INBOX, {
 		id: messageId, subject: parsedEmail.subject || "",
-		sender: (parsedEmail.from?.address || "").toLowerCase(), recipient: allRecipients.join(", "),
+		sender: (parsedEmail.from?.address || "").toLowerCase(), recipient: mimeToRecipients.join(", "),
 		cc: ccRecipients.join(", ") || null, bcc: bccRecipients.join(", ") || null,
 		date: new Date().toISOString(), // uses receive time, not the email's Date header
 		body: parsedEmail.html || parsedEmail.text || "",

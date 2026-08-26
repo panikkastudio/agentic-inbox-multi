@@ -13,11 +13,16 @@ type TestEnv = Env & {
 	EMAIL_ADDRESSES: string[];
 };
 
-async function request(path: string, init?: RequestInit, requestEnv: Env = workerEnv) {
+async function request(
+	path: string,
+	init?: RequestInit,
+	requestEnv: Env = workerEnv,
+	context: ExecutionContext = createExecutionContext(),
+) {
 	return worker.fetch(
 		new Request(`https://worker.test${path}`, init),
 		requestEnv,
-		createExecutionContext(),
+		context,
 	);
 }
 
@@ -285,7 +290,7 @@ describe("Worker behavior", () => {
 		await waitOnExecutionContext(context);
 	});
 
-	it("routes inbound mail using the SMTP envelope recipient", async () => {
+	it("routes mismatched MIME recipients to the normalized envelope mailbox", async () => {
 		const secondMailbox = "hello@second.test";
 		await createMailbox(mailboxAddress, "Example Hello");
 		await createMailbox(secondMailbox, "Second Hello");
@@ -294,25 +299,228 @@ describe("Worker behavior", () => {
 		await worker.email(
 			cloudflareEmailEvent(
 				"From: sender@external.test\r\n" +
-					"To: hello@example.com\r\n" +
+					"To: first@example.com\r\n" +
+					"Cc: copy@example.com\r\n" +
+					"Bcc: blind@example.com\r\n" +
 					"Subject: Envelope recipient\r\n" +
+					"Message-ID: <envelope-1@external.test>\r\n" +
 					"Content-Type: text/plain; charset=utf-8\r\n" +
 					"\r\n" +
 					"Hello\r\n",
+				"HELLO@SECOND.TEST.",
+			),
+			workerEnv,
+			context,
+		);
+		await waitOnExecutionContext(context);
+
+		const secondResponse = await request(
+			`/api/v1/mailboxes/${secondMailbox}/emails?folder=inbox`,
+		);
+		const secondInbox = await secondResponse.json() as { emails: Array<Record<string, string>>; totalCount: number };
+		expect(secondInbox.totalCount).toBe(1);
+		expect(secondInbox.emails[0]).toMatchObject({
+			recipient: "first@example.com",
+			cc: "copy@example.com",
+			bcc: "blind@example.com",
+		});
+		const detailResponse = await request(
+			`/api/v1/mailboxes/${secondMailbox}/emails/${secondInbox.emails[0].id}`,
+		);
+		const detail = await detailResponse.json() as { raw_headers: string };
+		const rawHeaders = JSON.parse(detail.raw_headers) as Array<{ key: string; value: string }>;
+		expect(rawHeaders).toEqual(expect.arrayContaining([
+			{ key: "to", value: "first@example.com" },
+			{ key: "cc", value: "copy@example.com" },
+			{ key: "bcc", value: "blind@example.com" },
+		]));
+
+		const firstResponse = await request(
+			`/api/v1/mailboxes/${mailboxAddress}/emails?folder=inbox`,
+		);
+		expect(await firstResponse.json()).toMatchObject({ totalCount: 0 });
+	});
+
+	it("keeps same-local-part sent attachments isolated by domain", async () => {
+		const firstMailbox = "hello@example.com";
+		const secondMailbox = "hello@second.test";
+		const emailEnv = {
+			...workerEnv,
+			EMAIL: { send: async () => ({ messageId: "test-outbound-message-id" }) },
+		} as unknown as TestEnv;
+		await createMailbox(firstMailbox, "Example Hello", emailEnv);
+		await createMailbox(secondMailbox, "Second Hello", emailEnv);
+
+		for (const mailbox of [firstMailbox, secondMailbox]) {
+			const context = createExecutionContext();
+			const response = await request(`/api/v1/mailboxes/${mailbox}/emails`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					to: "recipient@external.test",
+					from: mailbox,
+					subject: `Sent from ${mailbox}`,
+					text: "Hello",
+					attachments: [{
+						content: "SGVsbG8=",
+						filename: "note.txt",
+						type: "text/plain",
+						disposition: "attachment",
+					}],
+				}),
+			}, emailEnv, context);
+			expect(response.status).toBe(202);
+			await waitOnExecutionContext(context);
+
+			const sentResponse = await request(
+				`/api/v1/mailboxes/${mailbox}/emails?folder=sent`,
+				undefined,
+				emailEnv,
+			);
+			const sent = await sentResponse.json() as { emails: Array<{ id: string }>; totalCount: number };
+			expect(sent.totalCount).toBe(1);
+			const detailResponse = await request(
+				`/api/v1/mailboxes/${mailbox}/emails/${sent.emails[0].id}`,
+				undefined,
+				emailEnv,
+			);
+			expect(await detailResponse.json()).toMatchObject({
+				attachments: [{ filename: "note.txt" }],
+			});
+		}
+	});
+
+	it("delivers BCC mail without a MIME To recipient", async () => {
+		const secondMailbox = "hello@second.test";
+		await createMailbox(secondMailbox, "Second Hello");
+
+		const context = createExecutionContext();
+		await worker.email(
+			cloudflareEmailEvent(
+				"From: sender@external.test\r\n" +
+					"Subject: Blind delivery\r\n" +
+					"Bcc: blind@example.com\r\n" +
+					"Content-Type: text/plain; charset=utf-8\r\n" +
+					"\r\n" +
+					"Secret hello\r\n",
 				secondMailbox,
 			),
 			workerEnv,
 			context,
 		);
+		await waitOnExecutionContext(context);
 
-		const secondResponse = await request(
+		const response = await request(
 			`/api/v1/mailboxes/${secondMailbox}/emails?folder=inbox`,
 		);
-		expect(await secondResponse.json()).toMatchObject({ totalCount: 1 });
-		const firstResponse = await request(
-			`/api/v1/mailboxes/${mailboxAddress}/emails?folder=inbox`,
+		expect(await response.json()).toMatchObject({
+			totalCount: 1,
+			emails: [{ recipient: "", bcc: "blind@example.com" }],
+		});
+	});
+
+	it("ignores unauthorized envelope mail without parsing or creating state", async () => {
+		const exactEnv = {
+			...workerEnv,
+			DOMAINS: "example.com",
+			EMAIL_ADDRESSES: ["allowed@example.com"],
+		} as TestEnv;
+		const context = createExecutionContext();
+
+		await worker.email(
+			cloudflareEmailEvent("not a MIME message", "other@example.com"),
+			exactEnv,
+			context,
 		);
-		expect(await firstResponse.json()).toMatchObject({ totalCount: 0 });
 		await waitOnExecutionContext(context);
+
+		const response = await request("/api/v1/mailboxes", undefined, exactEnv);
+		expect(await response.json()).toEqual([]);
+	});
+
+	it("ignores configured-domain mail when its mailbox does not exist", async () => {
+		const context = createExecutionContext();
+
+		await worker.email(
+			cloudflareEmailEvent("not a MIME message", "missing@example.com"),
+			workerEnv,
+			context,
+		);
+		await waitOnExecutionContext(context);
+
+		const response = await request("/api/v1/mailboxes");
+		expect(await response.json()).toEqual([]);
+	});
+
+	it("replies and forwards from the receiving mailbox domain", async () => {
+		const secondMailbox = "hello@second.test";
+		const sentMessages: Array<{ from: string; headers?: Record<string, string> }> = [];
+		const emailEnv = {
+			...workerEnv,
+			EMAIL: {
+				send: async (message: { from: string; headers?: Record<string, string> }) => {
+					sentMessages.push(message);
+					return { messageId: "test-outbound-message-id" };
+				},
+			},
+		} as unknown as TestEnv;
+		await createMailbox(secondMailbox, "Second Hello", emailEnv);
+
+		const inboundContext = createExecutionContext();
+		await worker.email(
+			cloudflareEmailEvent(
+				"From: sender@external.test\r\n" +
+					"To: first@example.com\r\n" +
+					"Subject: Reply target\r\n" +
+					"Message-ID: <reply-target@external.test>\r\n" +
+					"Content-Type: text/plain; charset=utf-8\r\n" +
+					"\r\n" +
+					"Please reply\r\n",
+				secondMailbox,
+			),
+			emailEnv,
+			inboundContext,
+		);
+		await waitOnExecutionContext(inboundContext);
+
+		const inboxResponse = await request(
+			`/api/v1/mailboxes/${secondMailbox}/emails?folder=inbox`,
+			undefined,
+			emailEnv,
+		);
+		const inbox = await inboxResponse.json() as { emails: Array<{ id: string }> };
+		const originalId = inbox.emails[0].id;
+
+		const sendFollowUp = async (path: string, subject: string) => {
+			const context = createExecutionContext();
+			const response = await request(path, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					to: "sender@external.test",
+					from: secondMailbox,
+					subject,
+					text: "Follow-up",
+				}),
+			}, emailEnv, context);
+			expect(response.status).toBe(202);
+			await waitOnExecutionContext(context);
+		};
+
+		await sendFollowUp(
+			`/api/v1/mailboxes/${secondMailbox}/emails/${originalId}/reply`,
+			"Re: Reply target",
+		);
+		await sendFollowUp(
+			`/api/v1/mailboxes/${secondMailbox}/emails/${originalId}/forward`,
+			"Fwd: Reply target",
+		);
+
+		expect(sentMessages).toHaveLength(2);
+		expect(sentMessages.map(({ from }) => from)).toEqual([secondMailbox, secondMailbox]);
+		expect(sentMessages.map(({ headers }) => headers?.["Message-ID"])).toEqual([
+			expect.stringMatching(/@second\.test>$/),
+			expect.stringMatching(/@second\.test>$/),
+		]);
 	});
 });
