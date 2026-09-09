@@ -390,18 +390,15 @@ describe("Worker behavior", () => {
 		}
 	});
 
-	it("isolates inbound attachments and Email Agent context by domain", async () => {
+	it("isolates inbound attachments without triggering AI drafts", async () => {
 		const firstMailbox = "hello@example.com";
 		const secondMailbox = "hello@second.test";
 		const emailEnv = workerEnv;
 		await createMailbox(firstMailbox, "Example Hello", emailEnv);
 		await createMailbox(secondMailbox, "Second Hello", emailEnv);
 
-		const subjects = new Map<string, string>();
-		const agentMessages = new Map<string, string>();
 		for (const mailbox of [firstMailbox, secondMailbox]) {
 			const subject = `Inbound for ${mailbox}`;
-			subjects.set(mailbox, subject);
 			const attachmentBody = mailbox === firstMailbox
 				? "Example attachment"
 				: "Second attachment";
@@ -465,13 +462,8 @@ describe("Worker behavior", () => {
 			}));
 			expect(messagesResponse.status).toBe(200);
 			const messages = await messagesResponse.json() as unknown[];
-			expect(messages).toHaveLength(2);
-			agentMessages.set(mailbox, JSON.stringify(messages));
-			expect(agentMessages.get(mailbox)).toContain(subject);
+			expect(messages).toHaveLength(0);
 		}
-
-		expect(agentMessages.get(firstMailbox)).not.toContain(subjects.get(secondMailbox));
-		expect(agentMessages.get(secondMailbox)).not.toContain(subjects.get(firstMailbox));
 	});
 
 	it("delivers BCC mail without a MIME To recipient", async () => {
