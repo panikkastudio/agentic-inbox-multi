@@ -11,7 +11,7 @@ Mission: `mission_87266c6b-9d24-4382-a0fe-276aba290e64`
 
    **Recommendation**
 
-       Keep `wrangler.test.jsonc` as the explicit local test configuration and avoid adding remote Email Service or Workers AI bindings to it.
+       Keep `tests/wrangler.test.jsonc` as the explicit local test configuration and avoid adding remote Email Service or Workers AI bindings to it.
 
 
 ## Assignment agentic-inbox-multi-jiik · Completed · 2026-08-26T14:32:10.408Z

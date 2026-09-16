@@ -1,8 +1,8 @@
 {
-	"$schema": "node_modules/wrangler/config-schema.json",
+	"$schema": "../node_modules/wrangler/config-schema.json",
 	"name": "agentic-inbox-test",
 	"compatibility_date": "2025-11-28",
-	"main": "./workers/app.ts",
+	"main": "../workers/app.ts",
 	"compatibility_flags": ["nodejs_compat"],
 	"vars": {
 		"DOMAINS": " Example.COM., second.test, example.com ",
