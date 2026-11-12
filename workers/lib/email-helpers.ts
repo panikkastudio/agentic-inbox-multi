@@ -86,18 +86,36 @@ export class SenderValidationError extends Error {
 	}
 }
 
-// ── Message ID ─────────────────────────────────────────────────────
+// ── Sent copy ──────────────────────────────────────────────────────
 
 /**
- * Generate an internal UUID and a proper RFC 2822 Message-ID.
+ * Raw headers saved with the Sent copy of an outgoing email, mirroring what
+ * the recipient receives (Message-ID is the one Email Service assigned).
  */
-export function generateMessageId(fromDomain: string): {
+export function buildSentRawHeaders(params: {
+	from: string | { email: string; name: string };
+	to: string | string[];
+	cc?: string | string[];
+	bcc?: string | string[];
+	subject: string;
+	date: string;
 	messageId: string;
-	outgoingMessageId: string;
-} {
-	const messageId = crypto.randomUUID();
-	const outgoingMessageId = `${messageId}@${fromDomain}`;
-	return { messageId, outgoingMessageId };
+	inReplyTo?: string | null;
+	references?: string[];
+}): string {
+	const list = (v: string | string[]) => (Array.isArray(v) ? v.join(", ") : v);
+	const { from, to, cc, bcc, subject, date, messageId, inReplyTo, references = [] } = params;
+	return JSON.stringify([
+		{ key: "from", value: typeof from === "string" ? from : `${from.name} <${from.email}>` },
+		{ key: "to", value: list(to) },
+		...(cc ? [{ key: "cc", value: list(cc) }] : []),
+		...(bcc ? [{ key: "bcc", value: list(bcc) }] : []),
+		{ key: "subject", value: subject },
+		{ key: "date", value: date },
+		{ key: "message-id", value: `<${messageId}>` },
+		...(inReplyTo ? [{ key: "in-reply-to", value: `<${inReplyTo}>` }] : []),
+		...(references.length > 0 ? [{ key: "references", value: references.map((r) => `<${r}>`).join(" ") }] : []),
+	]);
 }
 
 // ── Threading ──────────────────────────────────────────────────────
@@ -122,6 +140,31 @@ export function buildReferencesChain(original: EmailFull): {
 	const references = [...existingRefs, originalMsgId].filter(Boolean);
 	const threadId = original.thread_id || original.id;
 	return { originalMsgId, references, threadId };
+}
+
+type ThreadLookupStub = {
+	findThreadByMessageIds: (messageIds: string[]) => Promise<string | null>;
+};
+
+/**
+ * Find the conversation a message belongs to from the ids it points at.
+ * Checks In-Reply-To first, then References from newest to oldest, against
+ * the Message-IDs stored in this mailbox (inbound mail and our Sent copies,
+ * which carry the id Email Service assigned). Returns null when none match.
+ */
+export async function resolveThreadId(
+	stub: unknown,
+	inReplyTo: string | null | undefined,
+	references: string[] | null | undefined,
+): Promise<string | null> {
+	const strip = (id: string) => id.trim().replace(/^<+/, "").replace(/>+$/, "").trim();
+	const candidates = [inReplyTo, ...[...(references ?? [])].reverse()]
+		.filter((id): id is string => typeof id === "string")
+		.map(strip)
+		.filter(Boolean);
+	const unique = [...new Set(candidates)];
+	if (unique.length === 0) return null;
+	return (stub as ThreadLookupStub).findThreadByMessageIds(unique);
 }
 
 /**

@@ -8,6 +8,13 @@
  * Uses the `send_email` Worker binding (`env.EMAIL.send()`) to send emails.
  *
  * See: https://developers.cloudflare.com/email-service/api/send-emails/workers-api/
+ *
+ * Message-ID is platform-controlled: Email Service rejects it in `headers`
+ * (and silently replaces it in raw MIME). The id Cloudflare assigns is the
+ * one recipients see, and `send()` returns it, so callers must store the
+ * returned `messageId` to keep threading intact. In-Reply-To and References
+ * are allowed and must be passed on replies.
+ * See: https://developers.cloudflare.com/email-service/reference/headers/
  */
 
 export interface SendEmailParams {
@@ -26,7 +33,22 @@ export interface SendEmailParams {
 		disposition: "attachment" | "inline";
 		contentId?: string;
 	}[];
+	/** Allowlisted headers only (e.g. In-Reply-To, References, X-*). Never Message-ID. */
 	headers?: Record<string, string>;
+}
+
+/** Strip surrounding angle brackets and whitespace from a Message-ID. */
+export function normalizeMessageId(value: string): string {
+	return value.trim().replace(/^<+/, "").replace(/>+$/, "").trim();
+}
+
+/** A user-facing description of a failed send, including the Email Service error code. */
+export function describeSendError(error: unknown): string {
+	const message = error instanceof Error ? error.message : String(error);
+	const code = (error as { code?: unknown } | null)?.code;
+	return typeof code === "string" && code && !message.includes(code)
+		? `${message} (${code})`
+		: message;
 }
 
 /**
@@ -34,7 +56,7 @@ export interface SendEmailParams {
  *
  * @param binding  - The `EMAIL` SendEmail binding from env
  * @param params   - Email parameters (to, from, subject, body, etc.)
- * @returns The send result with messageId
+ * @returns The Message-ID Cloudflare assigned, without angle brackets
  * @throws On validation or delivery errors (error has `.code` property)
  */
 export async function sendEmail(
@@ -68,5 +90,7 @@ export async function sendEmail(
 	}
 
 	const result = await binding.send(message as any);
-	return { messageId: result.messageId };
+	const messageId = result?.messageId ? normalizeMessageId(result.messageId) : "";
+	if (!messageId) throw new Error("Email Service did not return a Message-ID");
+	return { messageId };
 }

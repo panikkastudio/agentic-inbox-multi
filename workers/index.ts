@@ -7,14 +7,15 @@ import { cors } from "hono/cors";
 import PostalMime from "postal-mime";
 import type { ForwardableEmailMessage } from "@cloudflare/workers-types";
 import { z } from "zod";
-import { sendEmail } from "./email-sender";
+import { sendEmail, describeSendError } from "./email-sender";
 import { storeAttachments, type StoredAttachment } from "./lib/attachments";
 import {
 	validateSender,
 	SenderValidationError,
-	generateMessageId,
 	buildThreadingHeaders,
+	buildSentRawHeaders,
 	listMailboxes,
+	resolveThreadId,
 } from "./lib/email-helpers";
 import { SendEmailRequestSchema } from "./lib/schemas";
 import { handleReplyEmail, handleForwardEmail } from "./routes/reply-forward";
@@ -173,9 +174,9 @@ app.post("/api/v1/mailboxes/:mailboxId/emails", async (c: AppContext) => {
 	const body = SendEmailRequestSchema.parse(await c.req.json());
 	const { to, cc, bcc, from, subject, html, text, attachments, in_reply_to, references, thread_id } = body;
 
-	let toStr: string, fromEmail: string, fromDomain: string;
+	let toStr: string, fromEmail: string;
 	try {
-		({ toStr, fromEmail, fromDomain } = validateSender(
+		({ toStr, fromEmail } = validateSender(
 			to,
 			from,
 			mailboxId,
@@ -186,40 +187,42 @@ app.post("/api/v1/mailboxes/:mailboxId/emails", async (c: AppContext) => {
 		throw e;
 	}
 
-	const { messageId, outgoingMessageId } = generateMessageId(fromDomain);
 	const stub = c.var.mailboxStub;
 	const rateLimitError = await (stub as any).checkSendRateLimit();
 	if (rateLimitError) return c.json({ error: rateLimitError }, 429);
+
+	// Send first and only file the message under Sent once Email Service has
+	// accepted it. Message-ID is platform-controlled, so we store the id that
+	// Cloudflare assigned (the one recipients see) to keep replies threading.
+	const threadingHeaders = in_reply_to ? buildThreadingHeaders(in_reply_to, references || []) : {};
+	let sentMessageId: string;
+	try {
+		({ messageId: sentMessageId } = await sendEmail(c.env.EMAIL, {
+			to, cc, bcc, from, subject, html, text,
+			attachments: attachments?.map((att) => ({ content: att.content, filename: att.filename, type: att.type, disposition: att.disposition || "attachment", contentId: att.contentId })),
+			headers: threadingHeaders,
+		}));
+	} catch (e) {
+		console.error("Email delivery failed:", describeSendError(e));
+		return c.json({ error: `Email was not sent: ${describeSendError(e)}` }, 502);
+	}
+
+	const messageId = crypto.randomUUID();
+	const date = new Date().toISOString();
 	const attachmentData = await storeAttachments(c.env.BUCKET, messageId, attachments);
+	const threadId = thread_id || (await resolveThreadId(stub, in_reply_to, references)) || messageId;
 
 	await stub.createEmail(Folders.SENT, {
 		id: messageId, subject, sender: fromEmail, recipient: toStr,
 		cc: cc ? (Array.isArray(cc) ? cc.join(", ") : cc).toLowerCase() : null,
 		bcc: bcc ? (Array.isArray(bcc) ? bcc.join(", ") : bcc).toLowerCase() : null,
-		date: new Date().toISOString(), body: html || text || "",
+		date, body: html || text || "",
 		in_reply_to: in_reply_to || null, email_references: references ? JSON.stringify(references) : null,
-		thread_id: thread_id || in_reply_to || messageId, message_id: outgoingMessageId,
-		raw_headers: JSON.stringify([
-			{ key: "from", value: typeof from === "string" ? from : `${from.name} <${from.email}>` },
-			{ key: "to", value: Array.isArray(to) ? to.join(", ") : to },
-			...(cc ? [{ key: "cc", value: Array.isArray(cc) ? cc.join(", ") : cc }] : []),
-			...(bcc ? [{ key: "bcc", value: Array.isArray(bcc) ? bcc.join(", ") : bcc }] : []),
-			{ key: "subject", value: subject }, { key: "date", value: new Date().toISOString() },
-			{ key: "message-id", value: `<${outgoingMessageId}>` },
-		]),
+		thread_id: threadId, message_id: sentMessageId,
+		raw_headers: buildSentRawHeaders({ from, to, cc, bcc, subject, date, messageId: sentMessageId, inReplyTo: in_reply_to, references }),
 	}, attachmentData);
 
-	c.executionCtx.waitUntil(
-		sendEmail(c.env.EMAIL, {
-			to, cc, bcc, from, subject, html, text,
-			attachments: attachments?.map((att) => ({ content: att.content, filename: att.filename, type: att.type, disposition: att.disposition || "attachment", contentId: att.contentId })),
-			headers: {
-				"Message-ID": `<${outgoingMessageId}>`,
-				...(in_reply_to ? buildThreadingHeaders(in_reply_to, references || []) : {}),
-			},
-		}).catch((e) => console.error("Deferred email delivery failed:", (e as Error).message)),
-	);
-	return c.json({ id: messageId, status: "sent" }, 202);
+	return c.json({ id: messageId, status: "sent", message_id: sentMessageId }, 202);
 });
 
 app.post("/api/v1/mailboxes/:mailboxId/drafts", async (c: AppContext) => {
@@ -406,7 +409,10 @@ async function receiveEmail(event: ForwardableEmailMessage, env: Env, ctx: Execu
 	const extractMsgId = (s: string) => { const m = s.match(/<([^>]+)>/); return m ? m[1] : s.trim().split(/\s+/)[0]; };
 	const inReplyTo = parsedEmail.inReplyTo ? extractMsgId(parsedEmail.inReplyTo) : null;
 	const emailReferences = parsedEmail.references ? parsedEmail.references.split(/\s+/).filter(Boolean).map(extractMsgId) : [];
-	let threadId = emailReferences[0] || inReplyTo || messageId;
+	// Thread by the ids the reply carries: match In-Reply-To / References
+	// against Message-IDs already stored in this mailbox (inbound and Sent).
+	let threadId = await resolveThreadId(stub, inReplyTo, emailReferences);
+	if (!threadId) threadId = emailReferences[0] || inReplyTo || messageId;
 
 	if (!inReplyTo && emailReferences.length === 0) {
 		const subjectThread = await (stub as any).findThreadBySubject(parsedEmail.subject || "", parsedEmail.from?.address || undefined);

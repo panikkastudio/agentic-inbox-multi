@@ -248,10 +248,81 @@ describe("Worker behavior", () => {
 			"hello@example.com",
 			"hello@second.test",
 		]);
-		expect(sentMessages.map(({ headers }) => headers?.["Message-ID"])).toEqual([
-			expect.stringMatching(/@example\.com>$/),
-			expect.stringMatching(/@second\.test>$/),
-		]);
+		// Message-ID is platform-controlled by Email Service; sending it fails.
+		expect(sentMessages.map(({ headers }) => headers?.["Message-ID"])).toEqual([undefined, undefined]);
+	});
+
+	it("reports a failed send and does not file it under Sent", async () => {
+		const emailEnv = {
+			...workerEnv,
+			EMAIL: {
+				send: async () => {
+					throw Object.assign(new Error("custom header 'Message-ID' is not allowed"), { code: "E_HEADER_NOT_ALLOWED" });
+				},
+			},
+		} as unknown as TestEnv;
+		await createMailbox("hello@example.com", "Hello", emailEnv);
+
+		const response = await request("/api/v1/mailboxes/hello@example.com/emails", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				to: "recipient@external.test",
+				from: "hello@example.com",
+				subject: "Will fail",
+				text: "Nope",
+			}),
+		}, emailEnv);
+
+		expect(response.status).toBe(502);
+		expect(await response.json()).toMatchObject({
+			error: expect.stringContaining("E_HEADER_NOT_ALLOWED"),
+		});
+		const sentResponse = await request("/api/v1/mailboxes/hello@example.com/emails?folder=sent", undefined, emailEnv);
+		expect(await sentResponse.json()).toMatchObject({ totalCount: 0 });
+	});
+
+	it("threads a reply to a new outbound message using the Message-ID Email Service assigned", async () => {
+		const mailbox = "hello@example.com";
+		const emailEnv = {
+			...workerEnv,
+			EMAIL: { send: async () => ({ messageId: "<cf-assigned-1@example.com>" }) },
+		} as unknown as TestEnv;
+		await createMailbox(mailbox, "Hello", emailEnv);
+
+		const sendResponse = await request(`/api/v1/mailboxes/${mailbox}/emails`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ to: "sender@external.test", from: mailbox, subject: "Kickoff", text: "Hi" }),
+		}, emailEnv);
+		expect(sendResponse.status).toBe(202);
+		const sent = await sendResponse.json() as { id: string; message_id: string };
+		expect(sent.message_id).toBe("cf-assigned-1@example.com");
+
+		const sentDetail = await (await request(`/api/v1/mailboxes/${mailbox}/emails/${sent.id}`, undefined, emailEnv)).json() as { thread_id: string; message_id: string };
+		expect(sentDetail.message_id).toBe("cf-assigned-1@example.com");
+
+		const inboundContext = createExecutionContext();
+		await worker.email(
+			cloudflareEmailEvent(
+				"From: sender@external.test\r\n" +
+					`To: ${mailbox}\r\n` +
+					"Subject: Re: Kickoff\r\n" +
+					"Message-ID: <their-reply@external.test>\r\n" +
+					"In-Reply-To: <cf-assigned-1@example.com>\r\n" +
+					"References: <cf-assigned-1@example.com>\r\n" +
+					"Content-Type: text/plain; charset=utf-8\r\n" +
+					"\r\n" +
+					"Thanks\r\n",
+				mailbox,
+			),
+			emailEnv,
+			inboundContext,
+		);
+		await waitOnExecutionContext(inboundContext);
+
+		const thread = await (await request(`/api/v1/mailboxes/${mailbox}/threads/${sentDetail.thread_id}`, undefined, emailEnv)).json() as Array<{ subject: string }>;
+		expect(thread.map(({ subject }) => subject)).toEqual(["Kickoff", "Re: Kickoff"]);
 	});
 
 	it("delivers an email to an existing mailbox through the email entrypoint", async () => {
@@ -594,9 +665,34 @@ describe("Worker behavior", () => {
 
 		expect(sentMessages).toHaveLength(2);
 		expect(sentMessages.map(({ from }) => from)).toEqual([secondMailbox, secondMailbox]);
-		expect(sentMessages.map(({ headers }) => headers?.["Message-ID"])).toEqual([
-			expect.stringMatching(/@second\.test>$/),
-			expect.stringMatching(/@second\.test>$/),
-		]);
+		expect(sentMessages.map(({ headers }) => headers?.["Message-ID"])).toEqual([undefined, undefined]);
+		expect(sentMessages[0].headers).toEqual({
+			"In-Reply-To": "<reply-target@external.test>",
+			References: "<reply-target@external.test>",
+		});
+
+		// The external sender answers our reply: it must join the original thread.
+		const answerContext = createExecutionContext();
+		await worker.email(
+			cloudflareEmailEvent(
+				"From: sender@external.test\r\n" +
+					`To: ${secondMailbox}\r\n` +
+					"Subject: Re: Reply target\r\n" +
+					"Message-ID: <answer@external.test>\r\n" +
+					"In-Reply-To: <test-outbound-message-id>\r\n" +
+					"References: <reply-target@external.test> <test-outbound-message-id>\r\n" +
+					"Content-Type: text/plain; charset=utf-8\r\n" +
+					"\r\n" +
+					"Got it\r\n",
+				secondMailbox,
+			),
+			emailEnv,
+			answerContext,
+		);
+		await waitOnExecutionContext(answerContext);
+
+		const original = await (await request(`/api/v1/mailboxes/${secondMailbox}/emails/${originalId}`, undefined, emailEnv)).json() as { thread_id: string };
+		const thread = await (await request(`/api/v1/mailboxes/${secondMailbox}/threads/${original.thread_id}`, undefined, emailEnv)).json() as Array<{ subject: string; folder_id: string }>;
+		expect(thread.map(({ subject }) => subject)).toEqual(["Reply target", "Re: Reply target", "Re: Reply target"]);
 	});
 });

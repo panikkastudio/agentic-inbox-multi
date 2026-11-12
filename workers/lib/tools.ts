@@ -22,12 +22,11 @@ import {
 	buildQuotedReplyBlock,
 	textToHtml,
 	listMailboxes,
-	generateMessageId,
 	buildReferencesChain,
 	buildThreadingHeaders,
 } from "./email-helpers";
 import { verifyDraft } from "./ai";
-import { sendEmail } from "../email-sender";
+import { sendEmail, describeSendError } from "../email-sender";
 import { Folders } from "../../shared/folders";
 import type { Env } from "../types";
 import { getMailboxPolicy, isAllowedMailboxAddress } from "./mailbox-policy";
@@ -422,9 +421,7 @@ export async function toolSendReply(
 	}
 
 	const { originalMsgId, references, threadId } = buildReferencesChain(originalEmail);
-	const fromDomain = mailboxId.split("@")[1];
-	if (!fromDomain) throw new Error("Invalid mailbox email address");
-	const { messageId, outgoingMessageId } = generateMessageId(fromDomain);
+	const messageId = crypto.randomUUID();
 
 	// Verify and append quoted original message
 	const sanitizedBody = await verifyDraft(env.AI, params.bodyHtml);
@@ -438,20 +435,18 @@ export async function toolSendReply(
 	});
 	const fullBodyHtml = sanitizedBody + quotedBlock;
 
+	let sentMessageId: string;
 	try {
-		await sendEmail(env.EMAIL, {
+		({ messageId: sentMessageId } = await sendEmail(env.EMAIL, {
 			to: params.to,
 			from: mailboxId,
 			subject: params.subject,
 			html: fullBodyHtml,
-			headers: {
-				"Message-ID": `<${outgoingMessageId}>`,
-				...buildThreadingHeaders(originalMsgId, references),
-			},
-		});
+			headers: buildThreadingHeaders(originalMsgId, references),
+		}));
 	} catch (e) {
-		console.error("Email send failed:", (e as Error).message);
-		return { error: `Failed to send reply: ${(e as Error).message}` };
+		console.error("Email send failed:", describeSendError(e));
+		return { error: `Failed to send reply: ${describeSendError(e)}` };
 	}
 
 	await stub.createEmail(
@@ -467,7 +462,7 @@ export async function toolSendReply(
 			email_references:
 				references.length > 0 ? JSON.stringify(references) : null,
 			thread_id: threadId,
-			message_id: outgoingMessageId,
+			message_id: sentMessageId,
 		},
 		[],
 	);
@@ -501,26 +496,24 @@ export async function toolSendEmail(
 		return { error: rateLimitError };
 	}
 
-	const fromDomain = mailboxId.split("@")[1];
-	if (!fromDomain) throw new Error("Invalid mailbox email address");
-	const { messageId, outgoingMessageId } = generateMessageId(fromDomain);
+	const messageId = crypto.randomUUID();
 
 	const sanitizedBody = await verifyDraft(env.AI, params.bodyHtml);
 	if (!sanitizedBody) {
 		return { error: "Draft verification failed — refusing to send unverified content. Please try again." };
 	}
 
+	let sentMessageId: string;
 	try {
-		await sendEmail(env.EMAIL, {
+		({ messageId: sentMessageId } = await sendEmail(env.EMAIL, {
 			to: params.to,
 			from: mailboxId,
 			subject: params.subject,
 			html: sanitizedBody,
-			headers: { "Message-ID": `<${outgoingMessageId}>` },
-		});
+		}));
 	} catch (e) {
-		console.error("Email send failed:", (e as Error).message);
-		return { error: `Failed to send email: ${(e as Error).message}` };
+		console.error("Email send failed:", describeSendError(e));
+		return { error: `Failed to send email: ${describeSendError(e)}` };
 	}
 
 	await stub.createEmail(
@@ -535,7 +528,7 @@ export async function toolSendEmail(
 			in_reply_to: null,
 			email_references: null,
 			thread_id: messageId,
-			message_id: outgoingMessageId,
+			message_id: sentMessageId,
 		},
 		[],
 	);

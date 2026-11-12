@@ -3,15 +3,15 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 import type { Context } from "hono";
-import { sendEmail } from "../email-sender";
+import { sendEmail, describeSendError } from "../email-sender";
 import { storeAttachments } from "../lib/attachments";
 import type { EmailFull } from "../lib/schemas";
 import {
 	validateSender,
 	SenderValidationError,
-	generateMessageId,
 	buildReferencesChain,
 	buildThreadingHeaders,
+	buildSentRawHeaders,
 	resolveOriginalEmail,
 } from "../lib/email-helpers";
 import { SendEmailRequestSchema } from "../lib/schemas";
@@ -38,9 +38,9 @@ export async function handleReplyEmail(c: AppContext) {
 	const originalEmail = await resolveOriginalEmail(stub, rawOriginal);
 	const { originalMsgId, references, threadId: thread_id } = buildReferencesChain(originalEmail);
 
-	let toStr: string, fromEmail: string, fromDomain: string;
+	let toStr: string, fromEmail: string;
 	try {
-		({ toStr, fromEmail, fromDomain } = validateSender(
+		({ toStr, fromEmail } = validateSender(
 			to,
 			from,
 			mailboxId,
@@ -51,50 +51,17 @@ export async function handleReplyEmail(c: AppContext) {
 		throw e;
 	}
 
-	const { messageId, outgoingMessageId } = generateMessageId(fromDomain);
-
 	const rateLimitError = await (stub as unknown as RateLimitStub)
 		.checkSendRateLimit();
 	if (rateLimitError) {
 		return c.json({ error: rateLimitError }, 429);
 	}
 
-	const attachmentData = await storeAttachments(c.env.BUCKET, messageId, attachments);
-
-	await stub.createEmail(
-		Folders.SENT,
-		{
-			id: messageId,
-			subject,
-			sender: fromEmail,
-			recipient: toStr,
-			cc: cc ? (Array.isArray(cc) ? cc.join(", ") : cc).toLowerCase() : null,
-			bcc: bcc ? (Array.isArray(bcc) ? bcc.join(", ") : bcc).toLowerCase() : null,
-			date: new Date().toISOString(),
-			body: html || text || "",
-			in_reply_to: originalMsgId,
-			email_references: JSON.stringify(references),
-			thread_id: thread_id,
-			message_id: outgoingMessageId,
-			raw_headers: JSON.stringify([
-				{ key: "from", value: typeof from === "string" ? from : `${from.name} <${from.email}>` },
-				{ key: "to", value: Array.isArray(to) ? to.join(", ") : to },
-				...(cc ? [{ key: "cc", value: Array.isArray(cc) ? cc.join(", ") : cc }] : []),
-				...(bcc ? [{ key: "bcc", value: Array.isArray(bcc) ? bcc.join(", ") : bcc }] : []),
-				{ key: "subject", value: subject },
-				{ key: "date", value: new Date().toISOString() },
-				{ key: "message-id", value: `<${outgoingMessageId}>` },
-				...(originalMsgId ? [{ key: "in-reply-to", value: `<${originalMsgId}>` }] : []),
-				...(references.length > 0 ? [{ key: "references", value: references.map((r: string) => `<${r}>`).join(" ") }] : []),
-			]),
-		},
-		attachmentData,
-	);
-
-	await stub.markThreadRead(thread_id);
-
-	c.executionCtx.waitUntil(
-		sendEmail(c.env.EMAIL, {
+	// Send first; only file under Sent once Email Service accepted it, and
+	// store the Message-ID it assigned so the recipient's reply threads back.
+	let sentMessageId: string;
+	try {
+		({ messageId: sentMessageId } = await sendEmail(c.env.EMAIL, {
 			to,
 			cc,
 			bcc,
@@ -109,16 +76,45 @@ export async function handleReplyEmail(c: AppContext) {
 				disposition: att.disposition,
 				contentId: att.contentId,
 			})),
-			headers: {
-				"Message-ID": `<${outgoingMessageId}>`,
-				...buildThreadingHeaders(originalMsgId, references),
-			},
-		}).catch((e) => {
-			console.error("Deferred reply delivery failed:", (e as Error).message);
-		}),
+			headers: buildThreadingHeaders(originalMsgId, references),
+		}));
+	} catch (e) {
+		console.error("Reply delivery failed:", describeSendError(e));
+		return c.json({ error: `Reply was not sent: ${describeSendError(e)}` }, 502);
+	}
+
+	const messageId = crypto.randomUUID();
+	const date = new Date().toISOString();
+	const attachmentData = await storeAttachments(c.env.BUCKET, messageId, attachments);
+
+	await stub.createEmail(
+		Folders.SENT,
+		{
+			id: messageId,
+			subject,
+			sender: fromEmail,
+			recipient: toStr,
+			cc: cc ? (Array.isArray(cc) ? cc.join(", ") : cc).toLowerCase() : null,
+			bcc: bcc ? (Array.isArray(bcc) ? bcc.join(", ") : bcc).toLowerCase() : null,
+			date,
+			body: html || text || "",
+			in_reply_to: originalMsgId,
+			email_references: JSON.stringify(references),
+			thread_id: thread_id,
+			message_id: sentMessageId,
+			raw_headers: buildSentRawHeaders({
+				from, to, cc, bcc, subject, date,
+				messageId: sentMessageId,
+				inReplyTo: originalMsgId,
+				references,
+			}),
+		},
+		attachmentData,
 	);
 
-	return c.json({ id: messageId, status: "sent" }, 202);
+	await stub.markThreadRead(thread_id);
+
+	return c.json({ id: messageId, status: "sent", message_id: sentMessageId }, 202);
 }
 
 export async function handleForwardEmail(c: AppContext) {
@@ -136,9 +132,9 @@ export async function handleForwardEmail(c: AppContext) {
 
 	await resolveOriginalEmail(stub, rawOriginal);
 
-	let toStr: string, fromEmail: string, fromDomain: string;
+	let toStr: string, fromEmail: string;
 	try {
-		({ toStr, fromEmail, fromDomain } = validateSender(
+		({ toStr, fromEmail } = validateSender(
 			to,
 			from,
 			mailboxId,
@@ -149,14 +145,37 @@ export async function handleForwardEmail(c: AppContext) {
 		throw e;
 	}
 
-	const { messageId, outgoingMessageId } = generateMessageId(fromDomain);
-
 	const rateLimitError = await (stub as unknown as RateLimitStub)
 		.checkSendRateLimit();
 	if (rateLimitError) {
 		return c.json({ error: rateLimitError }, 429);
 	}
 
+	let sentMessageId: string;
+	try {
+		({ messageId: sentMessageId } = await sendEmail(c.env.EMAIL, {
+			to,
+			cc,
+			bcc,
+			from,
+			subject,
+			html,
+			text,
+			attachments: attachments?.map((att) => ({
+				content: att.content,
+				filename: att.filename,
+				type: att.type,
+				disposition: att.disposition,
+				contentId: att.contentId,
+			})),
+		}));
+	} catch (e) {
+		console.error("Forward delivery failed:", describeSendError(e));
+		return c.json({ error: `Forward was not sent: ${describeSendError(e)}` }, 502);
+	}
+
+	const messageId = crypto.randomUUID();
+	const date = new Date().toISOString();
 	const attachmentData = await storeAttachments(c.env.BUCKET, messageId, attachments);
 
 	await stub.createEmail(
@@ -168,46 +187,16 @@ export async function handleForwardEmail(c: AppContext) {
 			recipient: toStr,
 			cc: cc ? (Array.isArray(cc) ? cc.join(", ") : cc).toLowerCase() : null,
 			bcc: bcc ? (Array.isArray(bcc) ? bcc.join(", ") : bcc).toLowerCase() : null,
-			date: new Date().toISOString(),
+			date,
 			body: html || text || "",
 			in_reply_to: null,
 			email_references: null,
 			thread_id: messageId,
-			message_id: outgoingMessageId,
-			raw_headers: JSON.stringify([
-				{ key: "from", value: typeof from === "string" ? from : `${from.name} <${from.email}>` },
-				{ key: "to", value: Array.isArray(to) ? to.join(", ") : to },
-				...(cc ? [{ key: "cc", value: Array.isArray(cc) ? cc.join(", ") : cc }] : []),
-				...(bcc ? [{ key: "bcc", value: Array.isArray(bcc) ? bcc.join(", ") : bcc }] : []),
-				{ key: "subject", value: subject },
-				{ key: "date", value: new Date().toISOString() },
-				{ key: "message-id", value: `<${outgoingMessageId}>` },
-			]),
+			message_id: sentMessageId,
+			raw_headers: buildSentRawHeaders({ from, to, cc, bcc, subject, date, messageId: sentMessageId }),
 		},
 		attachmentData,
 	);
 
-	c.executionCtx.waitUntil(
-		sendEmail(c.env.EMAIL, {
-			to,
-			cc,
-			bcc,
-			from,
-			subject,
-			html,
-			text,
-			headers: { "Message-ID": `<${outgoingMessageId}>` },
-			attachments: attachments?.map((att) => ({
-				content: att.content,
-				filename: att.filename,
-				type: att.type,
-				disposition: att.disposition,
-				contentId: att.contentId,
-			})),
-		}).catch((e) => {
-			console.error("Deferred forward delivery failed:", (e as Error).message);
-		}),
-	);
-
-	return c.json({ id: messageId, status: "sent" }, 202);
+	return c.json({ id: messageId, status: "sent", message_id: sentMessageId }, 202);
 }
