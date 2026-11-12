@@ -677,7 +677,7 @@ describe("Worker behavior", () => {
 			cloudflareEmailEvent(
 				"From: sender@external.test\r\n" +
 					`To: ${secondMailbox}\r\n` +
-					"Subject: Re: Reply target\r\n" +
+					"Subject: Re: Reply target (follow-up)\r\n" +
 					"Message-ID: <answer@external.test>\r\n" +
 					"In-Reply-To: <test-outbound-message-id>\r\n" +
 					"References: <reply-target@external.test> <test-outbound-message-id>\r\n" +
@@ -693,6 +693,9 @@ describe("Worker behavior", () => {
 
 		const original = await (await request(`/api/v1/mailboxes/${secondMailbox}/emails/${originalId}`, undefined, emailEnv)).json() as { thread_id: string };
 		const thread = await (await request(`/api/v1/mailboxes/${secondMailbox}/threads/${original.thread_id}`, undefined, emailEnv)).json() as Array<{ subject: string; folder_id: string }>;
-		expect(thread.map(({ subject }) => subject)).toEqual(["Reply target", "Re: Reply target", "Re: Reply target"]);
+		expect(thread.map(({ subject }) => subject)).toEqual(["Reply target", "Re: Reply target", "Re: Reply target (follow-up)"]);
+		const threaded = await (await request(`/api/v1/mailboxes/${secondMailbox}/emails?folder=inbox&threaded=true`, undefined, emailEnv)).json() as { emails: Array<{ thread_count: number }>; totalCount: number };
+		expect(threaded.totalCount).toBe(1);
+		expect(threaded.emails.map(({ thread_count }) => thread_count)).toEqual([3]);
 	});
 });

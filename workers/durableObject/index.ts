@@ -298,7 +298,7 @@ export class MailboxDO extends DurableObject<Env> {
 				FROM emails
 				WHERE folder_id = (SELECT id FROM folders WHERE name = ?1 OR id = ?1 LIMIT 1)
 			),
-			thread_to_conversation AS (
+			thread_to_conversation_by_subject AS (
 				SELECT
 					raw_thread_id,
 					normalized_subject,
@@ -308,6 +308,12 @@ export class MailboxDO extends DurableObject<Env> {
 					END as conversation_id
 				FROM folder_emails
 				GROUP BY raw_thread_id, normalized_subject, thread_id
+			),
+			-- One row per thread: a thread whose messages have different
+			-- subjects would otherwise join (and be counted) once per subject.
+			thread_to_conversation AS (
+				SELECT DISTINCT raw_thread_id, conversation_id
+				FROM thread_to_conversation_by_subject
 			),
 			all_emails_with_conversation AS (
 				SELECT
