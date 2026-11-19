@@ -21,6 +21,7 @@ import { SendEmailRequestSchema } from "./lib/schemas";
 import { handleReplyEmail, handleForwardEmail } from "./routes/reply-forward";
 import { Folders } from "../shared/folders";
 import type { Env } from "./types";
+import { emailBodyAsText, findMailboxWebhookUrl, postMailboxWebhook } from "./lib/mailbox-webhooks";
 import { requireMailbox, type MailboxContext } from "./lib/mailbox";
 import {
 	getMailboxPolicy,
@@ -431,6 +432,23 @@ async function receiveEmail(event: ForwardableEmailMessage, env: Env, ctx: Execu
 		thread_id: threadId, message_id: originalMessageId, raw_headers: JSON.stringify(parsedEmail.headers),
 	}, attachmentData);
 
+	const webhookUrl = findMailboxWebhookUrl(env.MAILBOX_WEBHOOKS, mailboxId);
+	if (webhookUrl) {
+		const emailThreadId = threadId || messageId;
+		// The email is already stored: a webhook failure must never bounce or re-deliver it.
+		const t3ThreadId = await ((stub as any).getT3ThreadLink(emailThreadId) as Promise<string | null>).catch((e) => {
+			console.error("Failed to read T3 thread link:", (e as Error).message);
+			return null;
+		});
+		ctx.waitUntil(postMailboxWebhook(webhookUrl, {
+			event: "email.received", mailboxId, emailId: messageId, emailThreadId, t3ThreadId,
+			isReply: emailThreadId !== messageId,
+			from: (parsedEmail.from?.address || "").toLowerCase(), fromName: parsedEmail.from?.name || null,
+			to: mimeToRecipients.join(", "), cc: ccRecipients.join(", ") || null,
+			subject: parsedEmail.subject || "", text: emailBodyAsText(parsedEmail.text, parsedEmail.html),
+			receivedAt: new Date().toISOString(),
+		}));
+	}
 }
 
 export { app, receiveEmail };

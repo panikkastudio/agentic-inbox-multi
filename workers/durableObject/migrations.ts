@@ -173,4 +173,15 @@ export const mailboxMigrations: Migration[] = [
 		name: "9_add_message_id_index",
 		sql: `CREATE INDEX IF NOT EXISTS idx_emails_message_id ON emails(message_id);`,
 	},
+	{
+		// One T3 Code thread per email thread, so replies land in the same conversation.
+		name: "10_add_t3_thread_links",
+		sql: `
+            CREATE TABLE IF NOT EXISTS t3_thread_links (
+                email_thread_id TEXT PRIMARY KEY,
+                t3_thread_id TEXT NOT NULL,
+                linked_at TEXT NOT NULL
+            );
+        `,
+	},
 ];

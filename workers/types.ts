@@ -5,4 +5,6 @@
 export interface Env extends Cloudflare.Env {
 	POLICY_AUD: string;
 	TEAM_DOMAIN: string;
+	/** JSON map of mailbox address → webhook URL, notified on every received email. */
+	MAILBOX_WEBHOOKS?: string;
 }

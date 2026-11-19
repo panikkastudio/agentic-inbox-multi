@@ -3,7 +3,7 @@ import type { ForwardableEmailMessage } from "@cloudflare/workers-types";
 import worker from "../workers/app";
 import type { Env } from "../workers/types";
 import { createExecutionContext, reset, waitOnExecutionContext } from "cloudflare:test";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 const mailboxAddress = "hello@example.com";
 const workerEnv = env as Env;
@@ -697,5 +697,66 @@ describe("Worker behavior", () => {
 		const threaded = await (await request(`/api/v1/mailboxes/${secondMailbox}/emails?folder=inbox&threaded=true`, undefined, emailEnv)).json() as { emails: Array<{ thread_count: number }>; totalCount: number };
 		expect(threaded.totalCount).toBe(1);
 		expect(threaded.emails.map(({ thread_count }) => thread_count)).toEqual([3]);
+	});
+
+	it("notifies the mailbox webhook with the linked T3 thread on every received email", async () => {
+		await createMailbox();
+		const webhookUrl = "https://t3.example/webhooks/shipwith";
+		const webhookEnv = { ...workerEnv, MAILBOX_WEBHOOKS: JSON.stringify({ "Hello@Example.com": webhookUrl }) } as Env;
+		const posts: Array<Record<string, unknown>> = [];
+		const realFetch = globalThis.fetch;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+			if (String(input) !== webhookUrl) return realFetch(input as RequestInfo, init);
+			posts.push(JSON.parse(String(init?.body)));
+			return new Response("ok");
+		});
+
+		const deliver = async (raw: string) => {
+			const context = createExecutionContext();
+			await worker.email(cloudflareEmailEvent(raw), webhookEnv, context);
+			await waitOnExecutionContext(context);
+		};
+
+		try {
+			await deliver(
+				"From: Ada <ada@external.test>\r\nTo: hello@example.com\r\nSubject: Pickup question\r\n" +
+					"Message-ID: <q-1@external.test>\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Can you pick up <b>Friday</b>?</p>\r\n",
+			);
+			expect(posts).toHaveLength(1);
+			expect(posts[0]).toMatchObject({
+				event: "email.received", mailboxId: mailboxAddress, t3ThreadId: null, isReply: false,
+				from: "ada@external.test", fromName: "Ada", subject: "Pickup question", text: "Can you pick up Friday?",
+			});
+			const emailThreadId = posts[0].emailThreadId as string;
+
+			const stub = workerEnv.MAILBOX.get(workerEnv.MAILBOX.idFromName(mailboxAddress));
+			await (stub as any).linkT3Thread(emailThreadId, "t3-thread-1");
+
+			await deliver(
+				"From: ada@external.test\r\nTo: hello@example.com\r\nSubject: Re: Pickup question\r\n" +
+					"Message-ID: <q-2@external.test>\r\nIn-Reply-To: <q-1@external.test>\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nAny update?\r\n",
+			);
+			expect(posts).toHaveLength(2);
+			expect(posts[1]).toMatchObject({ emailThreadId, t3ThreadId: "t3-thread-1", isReply: true, text: "Any update?" });
+		} finally {
+			fetchSpy.mockRestore();
+		}
+	});
+
+	it("does not call any webhook when the mailbox has none configured", async () => {
+		await createMailbox();
+		const fetchSpy = vi.spyOn(globalThis, "fetch");
+		const context = createExecutionContext();
+		try {
+			await worker.email(
+				cloudflareEmailEvent("From: a@external.test\r\nTo: hello@example.com\r\nSubject: Hi\r\n\r\nHi\r\n"),
+				{ ...workerEnv, MAILBOX_WEBHOOKS: JSON.stringify({ "other@example.com": "https://t3.example/x" }) } as Env,
+				context,
+			);
+			await waitOnExecutionContext(context);
+			expect(fetchSpy).not.toHaveBeenCalled();
+		} finally {
+			fetchSpy.mockRestore();
+		}
 	});
 });

@@ -743,6 +743,28 @@ export class MailboxDO extends DurableObject<Env> {
 		return row?.total ?? 0;
 	}
 
+	// ── T3 Code thread links (raw SQL) ─────────────────────────────
+
+	async getT3ThreadLink(emailThreadId: string): Promise<string | null> {
+		const row = [
+			...this.ctx.storage.sql.exec(
+				"SELECT t3_thread_id FROM t3_thread_links WHERE email_thread_id = ?",
+				emailThreadId,
+			),
+		][0] as { t3_thread_id: string } | undefined;
+		return row?.t3_thread_id ?? null;
+	}
+
+	async linkT3Thread(emailThreadId: string, t3ThreadId: string): Promise<void> {
+		this.ctx.storage.sql.exec(
+			`INSERT INTO t3_thread_links (email_thread_id, t3_thread_id, linked_at) VALUES (?, ?, ?)
+			 ON CONFLICT(email_thread_id) DO UPDATE SET t3_thread_id = excluded.t3_thread_id, linked_at = excluded.linked_at`,
+			emailThreadId,
+			t3ThreadId,
+			new Date().toISOString(),
+		);
+	}
+
 	// ── Threading helpers (raw SQL) ────────────────────────────────
 
 	/**

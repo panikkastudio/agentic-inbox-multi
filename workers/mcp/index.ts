@@ -400,6 +400,25 @@ export class EmailMCP extends McpAgent<Env> {
 			},
 		);
 
+		// ── link_t3_thread ─────────────────────────────────────────
+		this.server.tool(
+			"link_t3_thread",
+			"Link an email thread to a T3 Code thread. Later emails in that email thread are delivered to the linked T3 thread. " +
+				"For a new email sent with send_email, the email thread ID is the returned messageId.",
+			{
+				mailboxId: z.string().describe("The mailbox email address"),
+				emailThreadId: z.string().describe("The email thread ID (thread_id of any email in the thread)"),
+				t3ThreadId: z.string().describe("The T3 Code thread ID"),
+			},
+			async ({ mailboxId, emailThreadId, t3ThreadId }) => {
+				const denied = await verifyMailbox(mailboxId);
+				if (denied) return denied;
+				const stub = env.MAILBOX.get(env.MAILBOX.idFromName(mailboxId));
+				await (stub as any).linkT3Thread(emailThreadId, t3ThreadId);
+				return mcpText({ status: "linked", mailboxId, emailThreadId, t3ThreadId });
+			},
+		);
+
 		// ── move_email ─────────────────────────────────────────────
 		this.server.tool(
 			"move_email",
